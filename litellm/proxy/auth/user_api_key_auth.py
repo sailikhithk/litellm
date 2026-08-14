@@ -26,6 +26,7 @@ from litellm.constants import (
     GLOBAL_PROXY_SPEND_CACHE_KEY,
     LITELLM_PROXY_BUDGET_NAME,
     LITELLM_PROXY_MASTER_KEY_ALIAS,
+    UI_SESSION_TOKEN_TEAM_ID,
 )
 from litellm.integrations.otel.model.config import is_otel_v2_enabled
 from litellm.integrations.otel.runtime import phase_span, seed_request_identity
@@ -2163,6 +2164,24 @@ def _team_obj_from_token(valid_token: UserAPIKeyAuth) -> LiteLLM_TeamTableCached
     )
 
 
+def _is_ui_session_token(valid_token: UserAPIKeyAuth) -> bool:
+    """An Admin UI session key, whose reserved team is absent by design rather than deleted.
+
+    The id alone cannot earn the exemption: a JWT names its own team, so a claim could
+    ask for a synthesized team whose empty ``models`` reads as every model. Both further
+    conditions are load-bearing against that. ``JWTAuthBuilderResult.jwt_claims`` is a
+    required dict on every JWT path, so ``is None`` (not falsiness, since it can be
+    ``{}``) excludes all of them, and the standard JWT identities carry no ``token``
+    either. Custom auth never reaches here at all unless the operator opts in with
+    ``custom_auth_run_common_checks``, and then it is their own code, not a caller.
+    """
+    return (
+        valid_token.team_id == UI_SESSION_TOKEN_TEAM_ID
+        and valid_token.token is not None
+        and valid_token.jwt_claims is None
+    )
+
+
 def _token_can_vouch_for_team(valid_token: UserAPIKeyAuth, lookup_error: BaseException) -> bool:
     """Whether the token's own team fields may stand in for a team that failed to
     resolve, without widening access.
@@ -2272,7 +2291,9 @@ async def _run_centralized_common_checks(
         )
 
     fetch_coros: Final = []
-    if user_api_key_auth_obj.team_id is not None:
+    if _is_ui_session_token(user_api_key_auth_obj):
+        fetch_coros.append(_safe_fetch("team", _team_from_token(user_api_key_auth_obj)))
+    elif user_api_key_auth_obj.team_id is not None:
         fetch_coros.append(
             _safe_fetch(
                 "team",
@@ -2487,6 +2508,12 @@ async def _run_centralized_common_checks(
         skip_budget_checks=skip_budget_checks,
         general_settings=general_settings,
     )
+
+
+async def _team_from_token(valid_token: UserAPIKeyAuth) -> LiteLLM_TeamTableCachedObj:
+    """Coroutine wrapper over ``_team_obj_from_token`` for the gather below, used
+    where the team is known not to be resolvable from the database."""
+    return _team_obj_from_token(valid_token)
 
 
 async def _noop_none() -> None:

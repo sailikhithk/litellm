@@ -4473,6 +4473,134 @@ async def test_centralized_common_checks_absent_team_refused_despite_db_unavaila
 
 
 @pytest.mark.asyncio
+async def test_centralized_common_checks_ui_session_team_is_not_treated_as_deleted():
+    """Every Admin UI session token is stamped with the reserved
+    ``litellm-dashboard`` team id, which never has a row, so the absent-team
+    refusal read the ordinary UI case as a deleted team and hard 404'd every
+    dashboard request. The sentinel resolves to the token-derived team without a
+    lookup that can only fail."""
+    import litellm.proxy.proxy_server as _proxy_server_mod
+    from fastapi import Request
+    from starlette.datastructures import URL
+
+    from litellm.constants import UI_SESSION_TOKEN_TEAM_ID
+    from litellm.proxy.auth.user_api_key_auth import TeamNotFoundError
+
+    token = UserAPIKeyAuth(
+        api_key="sk-test",
+        token="hashed-sk-test",
+        team_id=UI_SESSION_TOKEN_TEAM_ID,
+        models=[],
+        team_models=[],
+    )
+    request = Request(scope={"type": "http"})
+    request._url = URL(url="/chat/completions")
+    request._body = json.dumps({"model": "gpt-4.1"}).encode()
+
+    attrs = _proxy_attrs_for_centralized_checks(user_custom_auth=None)
+    originals = {a: getattr(_proxy_server_mod, a, None) for a in attrs}
+    try:
+        for k, v in attrs.items():
+            setattr(_proxy_server_mod, k, v)
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_object",
+                new_callable=AsyncMock,
+                side_effect=TeamNotFoundError(team_id=UI_SESSION_TOKEN_TEAM_ID),
+            ) as mock_get_team,
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.common_checks",
+                new_callable=AsyncMock,
+            ) as mock_checks,
+        ):
+            await _run_centralized_common_checks(
+                user_api_key_auth_obj=token,
+                request=request,
+                request_data={"model": "gpt-4.1"},
+                route="/chat/completions",
+            )
+        mock_get_team.assert_not_awaited()
+        mock_checks.assert_awaited_once()
+        assert mock_checks.call_args.kwargs["team_object"].team_id == UI_SESSION_TOKEN_TEAM_ID
+    finally:
+        for k, v in originals.items():
+            setattr(_proxy_server_mod, k, v)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        pytest.param(
+            {"token": "hashed-sk-test", "jwt_claims": {"team_id": "litellm-dashboard"}},
+            id="jwt_mapped_to_a_virtual_key",
+        ),
+        pytest.param(
+            {"token": None, "jwt_claims": {"team_id": "litellm-dashboard"}},
+            id="standard_jwt_identity",
+        ),
+        pytest.param({"token": None, "jwt_claims": None}, id="tokenless_identity"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_centralized_common_checks_non_ui_identity_claiming_ui_team_still_refused(identity):
+    """A JWT names its own team, so a claim carrying the reserved UI team id would
+    inherit the exemption and skip team enforcement entirely if the id alone earned it.
+    The synthesized team's empty ``models`` reads as every model, so that is a widening,
+    not just a bypass.
+
+    One row per guard, so neither can be dropped without a failure here: the JWT that
+    maps onto a real key row carries a token and is refused only by the claims check,
+    and the tokenless identity carries no claims and is refused only by the token check.
+    """
+    import litellm.proxy.proxy_server as _proxy_server_mod
+    from fastapi import Request
+    from starlette.datastructures import URL
+
+    from litellm.constants import UI_SESSION_TOKEN_TEAM_ID
+    from litellm.proxy.auth.user_api_key_auth import TeamNotFoundError
+
+    token = UserAPIKeyAuth(
+        api_key=None,
+        team_id=UI_SESSION_TOKEN_TEAM_ID,
+        models=[],
+        team_models=[],
+        **identity,
+    )
+    request = Request(scope={"type": "http"})
+    request._url = URL(url="/chat/completions")
+    request._body = json.dumps({"model": "gpt-4.1"}).encode()
+
+    attrs = _proxy_attrs_for_centralized_checks(user_custom_auth=None)
+    originals = {a: getattr(_proxy_server_mod, a, None) for a in attrs}
+    try:
+        for k, v in attrs.items():
+            setattr(_proxy_server_mod, k, v)
+        with (
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.get_team_object",
+                new_callable=AsyncMock,
+                side_effect=TeamNotFoundError(team_id=UI_SESSION_TOKEN_TEAM_ID),
+            ) as mock_get_team,
+            patch(
+                "litellm.proxy.auth.user_api_key_auth.common_checks",
+                new_callable=AsyncMock,
+            ) as mock_checks,
+            pytest.raises(TeamNotFoundError),
+        ):
+            await _run_centralized_common_checks(
+                user_api_key_auth_obj=token,
+                request=request,
+                request_data={"model": "gpt-4.1"},
+                route="/chat/completions",
+            )
+        mock_get_team.assert_awaited_once()
+        mock_checks.assert_not_awaited()
+    finally:
+        for k, v in originals.items():
+            setattr(_proxy_server_mod, k, v)
+
+
+@pytest.mark.asyncio
 async def test_centralized_common_checks_unreadable_team_keeps_db_unavailable_optout():
     """The counterpart: an unreadable team leaves the grant unknown rather than
     answered, so an operator who has accepted degraded authorization during a
